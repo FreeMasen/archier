@@ -22,7 +22,7 @@ jobs:
       ARCHIER_REQUIRE_CONFORMANCE: "1"
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
