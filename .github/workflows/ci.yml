@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  conformance:
+    name: Conformance suite (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Optional features must not change how standard ArchieML parses.
+        features:
+          - { name: default features, flags: "" }
+          - { name: no default features, flags: "--no-default-features" }
+          - { name: all features, flags: "--all-features" }
+    env:
+      # Fail, rather than skip, if the submodule is missing.
+      ARCHIER_REQUIRE_CONFORMANCE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the conformance suite
+        run: cargo test -p archier --test conformance ${{ matrix.features.flags }} -- --nocapture
