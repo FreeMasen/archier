@@ -48,11 +48,19 @@
 //! one exception: plain text inside a `{+key}` block, which makes archieml-js throw, is
 //! ignored. archieml-js behavior that contradicts the spec is not reproduced.
 //!
-//! The deprecated inline comments are not supported.
+//! # Options
+//!
+//! [`Parser::new_ext`] and [`load_ext`] take [`Options`] for the spec's optional and
+//! deprecated features, both off by default: case-insensitive keys (§1.3) and inline
+//! comments (§7).
 
 mod parser;
 mod scanners;
 pub mod value;
 
-pub use parser::{Event, Key, OffsetIter, Parser, Tag, TagEnd};
-pub use value::{Map, Value, load};
+pub use parser::{Event, Key, OffsetIter, Options, Parser, Tag, TagEnd};
+pub use value::{Map, Value, load, load_ext};
+
+/// The version of the ArchieML spec this crate implements, which (as the spec asks of
+/// parsers written before 1.0 is final) names the candidate recommendation followed.
+pub const SPEC_VERSION: &str = "1.0 CR 2015-10-15";

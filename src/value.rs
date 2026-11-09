@@ -4,7 +4,9 @@
 //! [`Event`] stream that applies ArchieML's semantics (dot-notation, overwriting
 //! duplicate keys, merging reopened object blocks) to produce a tree of [`Value`]s.
 
-use crate::parser::{Event, Key, Parser, Tag, TagEnd};
+use std::borrow::Cow;
+
+use crate::parser::{Event, Key, Options, Parser, Tag, TagEnd};
 
 /// An ArchieML value. All scalar values are strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,8 +120,8 @@ impl Map {
 
     /// The object holding the last segment of a dotted key, creating (or overwriting)
     /// intermediate objects as needed. Returns it along with that last segment.
-    fn parent_of<'k>(&mut self, key: Key<'k>) -> (&mut Map, &'k str) {
-        let mut segments = key.segments();
+    fn parent_of<'k>(&mut self, key: &'k str) -> (&mut Map, &'k str) {
+        let mut segments = key.split('.');
         let mut last = segments.next().unwrap_or_default();
         let mut map = self;
         for segment in segments {
@@ -172,15 +174,35 @@ impl std::ops::Index<&str> for Map {
 /// assert_eq!(doc["authors"].as_array().unwrap().len(), 1);
 /// ```
 pub fn load(text: &str) -> Map {
-    from_events(Parser::new(text))
+    load_ext(text, Options::empty())
+}
+
+/// Parses an ArchieML document into a [`Map`] with the given [`Options`].
+///
+/// ```
+/// use archier::Options;
+///
+/// let doc = archier::load_ext("Title: First\ntitle: Second", Options::CASE_INSENSITIVE_KEYS);
+/// assert_eq!(doc["title"].as_str(), Some("Second"));
+/// ```
+pub fn load_ext(text: &str, options: Options) -> Map {
+    from_events_ext(Parser::new_ext(text, options), options)
 }
 
 /// Builds a document from a stream of events, as produced by a [`Parser`].
 pub fn from_events<'a>(events: impl IntoIterator<Item = Event<'a>>) -> Map {
+    from_events_ext(events, Options::empty())
+}
+
+/// Builds a document from a stream of events. With [`Options::CASE_INSENSITIVE_KEYS`],
+/// every key is lowercased; the `type` of freeform array elements is kept as written.
+/// Other options only affect parsing.
+pub fn from_events_ext<'a>(events: impl IntoIterator<Item = Event<'a>>, options: Options) -> Map {
     let mut builder = Builder {
         root: Value::Object(Map::new()),
         scope: Vec::new(),
         stack: Vec::new(),
+        lowercase_keys: options.contains(Options::CASE_INSENSITIVE_KEYS),
     };
     for event in events {
         builder.push(event);
@@ -222,6 +244,7 @@ struct Builder {
     root: Value,
     scope: Path,
     stack: Vec<Container>,
+    lowercase_keys: bool,
 }
 
 fn resolve<'v>(root: &'v mut Value, path: &[Segment]) -> Option<&'v mut Value> {
@@ -242,6 +265,14 @@ fn typed(ty: &str, value: Value) -> Value {
 }
 
 impl Builder {
+    fn key<'k>(&self, key: Key<'k>) -> Cow<'k, str> {
+        if self.lowercase_keys {
+            Cow::Owned(key.as_str().to_lowercase())
+        } else {
+            Cow::Borrowed(key.as_str())
+        }
+    }
+
     fn top_array(&mut self) -> Option<(&mut Vec<Value>, ContainerKind, &Path)> {
         let container = self.stack.last()?;
         match resolve(&mut self.root, &container.path)? {
@@ -310,8 +341,12 @@ impl Builder {
                     if let Some(path) = self.append(typed(key.as_str(), value)) {
                         self.scope = path;
                     }
-                } else if let Some(map) = self.scope_object() {
-                    let (parent, last) = map.parent_of(key);
+                } else {
+                    let key = self.key(key);
+                    let Some(map) = self.scope_object() else {
+                        return;
+                    };
+                    let (parent, last) = map.parent_of(&key);
                     parent.insert(last, value);
                 }
             }
@@ -342,10 +377,11 @@ impl Builder {
             path.push(Segment::Key("value".to_owned()));
             path
         } else {
+            let key = self.key(key);
             let Some(map) = self.scope_object() else {
                 return;
             };
-            let (parent, last) = map.parent_of(key);
+            let (parent, last) = map.parent_of(&key);
             // Reopened top-level object blocks merge into the existing object. Nested
             // blocks and arrays always replace what was there.
             let reopen = !nested && is_object && matches!(parent.get(last), Some(Value::Object(_)));
@@ -353,7 +389,7 @@ impl Builder {
                 parent.insert(last, empty);
             }
             let mut path = self.scope.clone();
-            path.extend(key.segments().map(|s| Segment::Key(s.to_owned())));
+            path.extend(key.split('.').map(|s| Segment::Key(s.to_owned())));
             path
         };
         let outer_scope = self.scope.clone();
@@ -442,6 +478,30 @@ mod tests {
         assert_eq!(
             doc["l"],
             Value::Array(vec![Value::Object(Map::from_iter([("*k", s("v"))]))])
+        );
+    }
+
+    #[test]
+    fn case_insensitive_keys_are_lowercased() {
+        let text =
+            "Title: one\nTITLE: two\n{Meta.Info}\nA: 1\n{}\n{meta.info}\nb: 2\n[+Body]\nH1: x\n";
+        let doc = load_ext(text, Options::CASE_INSENSITIVE_KEYS);
+        assert_eq!(doc.keys().collect::<Vec<_>>(), ["title", "meta", "body"]);
+        assert_eq!(doc["title"], s("two"));
+        assert_eq!(
+            doc["meta"],
+            Value::Object(Map::from_iter([(
+                "info",
+                Value::Object(Map::from_iter([("a", s("1")), ("b", s("2"))]))
+            )]))
+        );
+        // Freeform types are values, not keys, so they keep their case.
+        assert_eq!(doc["body"], Value::Array(vec![typed("H1", s("x"))]));
+
+        let doc = load(text);
+        assert_eq!(
+            doc.keys().collect::<Vec<_>>(),
+            ["Title", "TITLE", "Meta", "meta", "Body"]
         );
     }
 
