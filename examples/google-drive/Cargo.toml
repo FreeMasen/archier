@@ -1,0 +1,20 @@
+[package]
+name = "google-drive-example"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Serves a Google Doc parsed as ArchieML, like archieml-js's examples/google_drive.js"
+
+[dependencies]
+archier = { path = "../.." }
+axum = "0.8.9"
+google-drive3 = "7.0.0"
+http-body-util = "0.1"
+oauth2 = { version = "5.0.0", features = ["reqwest"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+scraper = "0.29.0"
+serde = { version = "1", features = ["derive"] }
+# Keep the document's key order in the JSON response, as archieml-js does.
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+url = "2.5.8"
