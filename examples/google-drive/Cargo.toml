@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 description = "Serves a Google Doc parsed as ArchieML, like archieml-js's examples/google_drive.js"
 
+[lints]
+workspace = true
+
 [dependencies]
 archier = { path = "../.." }
 axum = "0.8.9"

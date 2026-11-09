@@ -45,12 +45,13 @@ impl<'a> Source<'a> {
         &self.text
     }
 
+    fn get(&self, range: Range<usize>) -> &str {
+        self.text.get(range).unwrap_or_default()
+    }
+
     /// A piece of the text, borrowing from the original where it is unchanged.
     fn slice(&self, range: Range<usize>) -> Cow<'a, str> {
-        match &self.text {
-            Cow::Borrowed(text) => Cow::Borrowed(&text[range]),
-            Cow::Owned(text) => Cow::Owned(text[range].to_owned()),
-        }
+        sub_cow(&self.text, range)
     }
 
     fn original(&self, pos: usize) -> usize {
@@ -75,13 +76,13 @@ impl Text {
                     slice.end = range.end;
                 }
             }
-            _ => self.push_str(&source.str()[range], source),
+            _ => self.push_str(source.get(range), source),
         }
     }
 
     fn push_str(&mut self, text: &str, source: &Source<'_>) {
         if let Text::Slice(slice) = self {
-            *self = Text::Owned(source.str()[slice.clone()].to_owned());
+            *self = Text::Owned(source.get(slice.clone()).to_owned());
         }
         if let Text::Owned(owned) = self {
             owned.push_str(text);
@@ -149,7 +150,7 @@ struct Token {
 fn tokenize(text: &str, line: Range<usize>) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut run = line.start;
-    for (offset, c) in text[line.clone()].char_indices() {
+    for (offset, c) in text.get(line.clone()).unwrap_or_default().char_indices() {
         let kind = match c {
             '{' => Kind::LeftBrace,
             '}' => Kind::RightBrace,
@@ -219,13 +220,15 @@ fn array_flags(key: &str) -> Option<(Range<usize>, Range<usize>)> {
             if !key.get(start..path).is_some_and(|f| f.chars().all(is_flag)) {
                 continue;
             }
-            let Some(first) = key[path..].chars().next().filter(|&c| !is_flag(c)) else {
+            let first = key.get(path..).and_then(|path| path.chars().next());
+            let Some(first) = first.filter(|&c| !is_flag(c)) else {
                 continue;
             };
             // `.` stops at line terminators.
             let rest = path + first.len_utf8();
-            let end = key[rest..]
-                .find(['\u{2028}', '\u{2029}'])
+            let end = key
+                .get(rest..)
+                .and_then(|rest| rest.find(['\u{2028}', '\u{2029}']))
                 .map_or(key.len(), |i| rest + i);
             return Some((start..path, path..end));
         }
@@ -236,8 +239,8 @@ fn array_flags(key: &str) -> Option<(Range<usize>, Range<usize>)> {
 /// A piece of a string, borrowing from the source if the string does.
 fn sub_cow<'a>(text: &Cow<'a, str>, range: Range<usize>) -> Cow<'a, str> {
     match text {
-        Cow::Borrowed(text) => Cow::Borrowed(&text[range]),
-        Cow::Owned(text) => Cow::Owned(text[range].to_owned()),
+        Cow::Borrowed(text) => Cow::Borrowed(text.get(range).unwrap_or_default()),
+        Cow::Owned(text) => Cow::Owned(text.get(range).unwrap_or_default().to_owned()),
     }
 }
 
@@ -296,7 +299,7 @@ impl<'a> BettyParser<'a> {
         if pos >= self.end {
             return None;
         }
-        let text = &self.source.str()[pos..self.end];
+        let text = self.source.get(pos..self.end);
         Some(pos..text.find('\n').map_or(self.end, |i| pos + i + 1))
     }
 
@@ -312,28 +315,35 @@ impl<'a> BettyParser<'a> {
     }
 
     fn str(&self, token: &Token) -> &str {
-        &self.source.str()[token.range.clone()]
+        self.source.get(token.range.clone())
     }
 
     fn trimmed(&self, token: &Token) -> Cow<'a, str> {
         trim(self.source.slice(token.range.clone()))
     }
 
-    fn kinds_match(tokens: &[Token], kinds: &[Option<Kind>]) -> bool {
-        tokens.len() >= kinds.len()
-            && tokens.iter().zip(kinds).all(|(token, kind)| match kind {
-                None => true,
-                Some(Kind::Text) => token.kind.is_text(),
-                Some(kind) => token.kind == *kind,
-            })
+    /// The first `N` tokens, if they have the given kinds; `None` matches any token, and
+    /// `Kind::Text` matches line endings too, as in betty.
+    fn matching<const N: usize>(tokens: &[Token], kinds: [Option<Kind>; N]) -> Option<&[Token; N]> {
+        let first = tokens.first_chunk::<N>()?;
+        let matches = first.iter().zip(kinds).all(|(token, kind)| match kind {
+            None => true,
+            Some(Kind::Text) => token.kind.is_text(),
+            Some(kind) => token.kind == kind,
+        });
+        matches.then_some(first)
     }
 
     /// `:word` at the start of the line, where the token after the colon starts with
     /// `word` in any case.
     fn is_command(&self, tokens: &[Token], word: &str) -> bool {
-        tokens.len() > 1 && tokens[0].kind == Kind::Colon && {
-            let next = self.str(&tokens[1]).as_bytes();
-            next.len() >= word.len() && next[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+        match tokens {
+            [colon, next, ..] if colon.kind == Kind::Colon => self
+                .str(next)
+                .as_bytes()
+                .get(..word.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(word.as_bytes())),
+            _ => false,
         }
     }
 
@@ -365,67 +375,59 @@ impl<'a> BettyParser<'a> {
         }
         self.pos = next;
 
-        let t = Some(Kind::Text);
-        if Self::kinds_match(&tokens, &[t, Some(Kind::Colon), Some(Kind::Colon), None])
-            && let Some(key) = self.key(&tokens[0])
+        let text = Some(Kind::Text);
+        let colon = Some(Kind::Colon);
+        let (left_brace, right_brace) = (Some(Kind::LeftBrace), Some(Kind::RightBrace));
+        let (left_bracket, right_bracket) = (Some(Kind::LeftBracket), Some(Kind::RightBracket));
+        let slash = Some(Kind::Slash);
+
+        if let Some([name, _, _, first]) = Self::matching(&tokens, [text, colon, colon, None])
+            && let Some(key) = self.key(name)
         {
-            self.multiline_value(key, &tokens, line);
+            self.multiline_value(key, first.range.start, line);
             return;
         }
-        if Self::kinds_match(&tokens, &[t, Some(Kind::Colon), None])
-            && let Some(key) = self.key(&tokens[0])
+        if let Some([name, _, first]) = Self::matching(&tokens, [text, colon, None])
+            && let Some(key) = self.key(name)
         {
-            let value = Text::Slice(tokens[2].range.start..line.end);
+            let value = Text::Slice(first.range.start..line.end);
             self.instruction(Instruction::Value { key, value }, line);
             return;
         }
-        let instruction = if Self::kinds_match(&tokens, &[Some(Kind::Star), t]) {
+        let instruction = if let Some([_, first]) =
+            Self::matching(&tokens, [Some(Kind::Star), text])
+        {
             Instruction::Simple {
-                value: Text::Slice(tokens[1].range.start..line.end),
+                value: Text::Slice(first.range.start..line.end),
             }
-        } else if Self::kinds_match(&tokens, &[Some(Kind::LeftBrace), t, Some(Kind::RightBrace)]) {
-            let key = self.trimmed(&tokens[1]);
+        } else if let Some([_, name, _]) = Self::matching(&tokens, [left_brace, text, right_brace])
+        {
+            let key = self.trimmed(name);
             if key.is_empty() {
                 Instruction::CloseObject(None)
             } else {
                 Instruction::Object(key)
             }
-        } else if Self::kinds_match(&tokens, &[Some(Kind::LeftBrace), Some(Kind::RightBrace)]) {
+        } else if Self::matching(&tokens, [left_brace, right_brace]).is_some() {
             Instruction::CloseObject(None)
-        } else if Self::kinds_match(
-            &tokens,
-            &[
-                Some(Kind::LeftBrace),
-                Some(Kind::Slash),
-                t,
-                Some(Kind::RightBrace),
-            ],
-        ) {
-            Instruction::CloseObject(Some(self.trimmed(&tokens[2])).filter(|k| !k.is_empty()))
-        } else if Self::kinds_match(
-            &tokens,
-            &[Some(Kind::LeftBracket), t, Some(Kind::RightBracket)],
-        ) {
-            match self.array(&tokens[1]) {
+        } else if let Some([_, _, name, _]) =
+            Self::matching(&tokens, [left_brace, slash, text, right_brace])
+        {
+            Instruction::CloseObject(Some(self.trimmed(name)).filter(|k| !k.is_empty()))
+        } else if let Some([_, name, _]) =
+            Self::matching(&tokens, [left_bracket, text, right_bracket])
+        {
+            match self.array(name) {
                 Some(instruction) => instruction,
                 // Betty throws when an array's key is only `+` and `.`; read it as text.
                 None => self.buffer_line(line.clone()),
             }
-        } else if Self::kinds_match(
-            &tokens,
-            &[Some(Kind::LeftBracket), Some(Kind::RightBracket)],
-        ) {
+        } else if Self::matching(&tokens, [left_bracket, right_bracket]).is_some() {
             Instruction::CloseArray(None)
-        } else if Self::kinds_match(
-            &tokens,
-            &[
-                Some(Kind::LeftBracket),
-                Some(Kind::Slash),
-                t,
-                Some(Kind::RightBracket),
-            ],
-        ) {
-            Instruction::CloseArray(Some(self.trimmed(&tokens[2])).filter(|k| !k.is_empty()))
+        } else if let Some([_, _, name, _]) =
+            Self::matching(&tokens, [left_bracket, slash, text, right_bracket])
+        {
+            Instruction::CloseArray(Some(self.trimmed(name)).filter(|k| !k.is_empty()))
         } else if self.is_command(&tokens, "end") && !self.is_command(&tokens, "endskip") {
             Instruction::Flush
         } else {
@@ -448,10 +450,10 @@ impl<'a> BettyParser<'a> {
             return Some(Instruction::CloseArray(None));
         }
         let (flags, path) = array_flags(&key)?;
-        let flags = &key[flags];
+        let flags = key.get(flags)?;
         let freeform = flags.contains('+');
         let path = if flags.contains('.') {
-            Cow::Owned(format!(".{}", &key[path]))
+            Cow::Owned(format!(".{}", key.get(path)?))
         } else {
             sub_cow(&key, path)
         };
@@ -459,25 +461,27 @@ impl<'a> BettyParser<'a> {
     }
 
     /// `key::` through the next `::key` line, which isn't included.
-    fn multiline_value(&mut self, key: Cow<'a, str>, tokens: &[Token], line: Range<usize>) {
+    ///
+    /// `start` is where the value starts, after `key::`.
+    fn multiline_value(&mut self, key: Cow<'a, str>, start: usize, line: Range<usize>) {
         let ender = key.to_lowercase();
         let pattern = Pattern::new(&ender);
         let mut pos = line.end;
         let mut end = self.end;
         while let Some(next) = self.line_at(pos) {
             let next_tokens = self.tokens(next.clone());
-            let closes = next_tokens.len() > 2
-                && next_tokens[0].kind == Kind::Colon
-                && next_tokens[1].kind == Kind::Colon
-                && {
-                    let name = self.str(&next_tokens[2]);
+            let closes = match next_tokens.as_slice() {
+                [a, b, name, ..] if a.kind == Kind::Colon && b.kind == Kind::Colon => {
+                    let name = self.str(name);
                     match &pattern {
                         Some(pattern) => pattern.test(name),
                         // Betty throws on keys that aren't valid patterns; match them
                         // literally instead.
                         None => name.to_lowercase().contains(&ender),
                     }
-                };
+                }
+                _ => false,
+            };
             if closes {
                 end = next.start;
                 pos = next.end;
@@ -486,7 +490,7 @@ impl<'a> BettyParser<'a> {
             pos = next.end;
         }
         self.pos = pos;
-        let value = Text::Slice(tokens[3].range.start..end);
+        let value = Text::Slice(start..end);
         self.instruction(Instruction::Value { key, value }, line.start..pos);
     }
 
@@ -503,10 +507,10 @@ impl<'a> BettyParser<'a> {
             }
             line_start = matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
         }
-        Some(match escape {
-            Some(i) => Cow::Owned(format!("{}{}", &text[..i], &text[i + 1..])),
-            None => text,
-        })
+        let unescaped = escape
+            .and_then(|i| text.split_at_checked(i))
+            .and_then(|(before, after)| Some(format!("{before}{}", after.strip_prefix('\\')?)));
+        Some(unescaped.map_or(text, Cow::Owned))
     }
 
     /// Emits the merged buffer as freeform text, one event per non-blank line.
@@ -652,7 +656,9 @@ mod tests {
 
     #[test]
     fn array_flags_match_bettys_pattern() {
-        let flags = |key: &'static str| array_flags(key).map(|(f, p)| (&key[f], &key[p]));
+        let flags = |key: &'static str| {
+            array_flags(key).and_then(|(f, p)| Some((key.get(f)?, key.get(p)?)))
+        };
         assert_eq!(flags("list"), Some(("", "list")));
         assert_eq!(flags("+.free.form"), Some(("+.", "free.form")));
         assert_eq!(flags(".+x"), Some((".+", "x")));

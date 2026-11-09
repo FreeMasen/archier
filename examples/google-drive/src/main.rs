@@ -223,24 +223,30 @@ fn untracked_url(href: &str) -> String {
 fn straighten_quotes_in_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find('<') {
-        out.push_str(&rest[..open]);
-        rest = &rest[open..];
-        match rest[1..].find(['<', '>']).map(|i| i + 1) {
-            Some(close) if rest[close..].starts_with('>') => {
-                let tag = &rest[..=close];
-                out.extend(tag.chars().map(|c| match c {
+    while let Some((before, after_open)) = rest.split_once('<') {
+        out.push_str(before);
+        out.push('<');
+        let next = after_open.find(['<', '>']);
+        let Some((inside, tail)) = next.and_then(|i| after_open.split_at_checked(i)) else {
+            // Nothing closes this `<`, so the rest is plain text.
+            rest = after_open;
+            break;
+        };
+        match tail.strip_prefix('>') {
+            Some(after_close) => {
+                out.extend(inside.chars().map(|c| match c {
                     '“' | '”' => '"',
                     '‘' | '’' => '\'',
                     c => c,
                 }));
-                rest = &rest[close + 1..];
+                out.push('>');
+                rest = after_close;
             }
-            Some(next) => {
-                out.push_str(&rest[..next]);
-                rest = &rest[next..];
+            // Another `<` comes first, so this one starts no tag.
+            None => {
+                out.push_str(inside);
+                rest = tail;
             }
-            None => break,
         }
     }
     out.push_str(rest);
@@ -282,7 +288,10 @@ mod tests {
              quote: <a href=\"https://example.com\">link</a> said “hi”\n"
         );
         let doc = to_json(&archier::Value::Object(archier::load(&text)));
-        assert_eq!(doc["tags"], serde_json::json!(["cabbages", "kings"]));
+        assert_eq!(
+            doc.get("tags"),
+            Some(&serde_json::json!(["cabbages", "kings"]))
+        );
         assert!(doc.get("ignored").is_none());
     }
 

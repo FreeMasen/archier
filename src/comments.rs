@@ -23,12 +23,9 @@ fn is_comment_char(b: u8) -> bool {
 
 /// The end of a bracketed run starting at `open` (`[^\[\]\n\r]*\]`), just past the `]`.
 fn bracketed(bytes: &[u8], open: usize) -> Option<usize> {
-    let close = open
-        + 1
-        + bytes[open + 1..]
-            .iter()
-            .take_while(|&&b| is_comment_char(b))
-            .count();
+    let start = open.checked_add(1)?;
+    let run = bytes.get(start..)?;
+    let close = start + run.iter().take_while(|&&b| is_comment_char(b)).count();
     (bytes.get(close) == Some(&b']')).then_some(close + 1)
 }
 
@@ -37,12 +34,14 @@ fn remove_comments(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
     let mut out = String::new();
     let (mut copied, mut i) = (0, 0);
-    while i < bytes.len() {
+    while let Some(&byte) = bytes.get(i) {
         // JavaScript's multiline `^` also matches after U+2028 and U+2029.
-        let line_start = i == 0
-            || matches!(bytes[i - 1], b'\n' | b'\r')
-            || matches!(bytes[..i], [.., 0xE2, 0x80, 0xA8 | 0xA9]);
-        let open = match bytes[i] {
+        let before = bytes.get(..i).unwrap_or_default();
+        let line_start = matches!(
+            before,
+            [] | [.., b'\n' | b'\r'] | [.., 0xE2, 0x80, 0xA8 | 0xA9]
+        );
+        let open = match byte {
             b'\\' if line_start && bytes.get(i + 1) == Some(&b'[') => i + 1,
             b'[' => i,
             _ => {
@@ -52,7 +51,7 @@ fn remove_comments(s: &str) -> Cow<'_, str> {
         };
         match bracketed(bytes, open) {
             Some(end) if bytes.get(end) != Some(&b']') => {
-                out.push_str(&s[copied..i]);
+                out.push_str(s.get(copied..i).unwrap_or_default());
                 copied = end;
                 i = end;
             }
@@ -62,7 +61,7 @@ fn remove_comments(s: &str) -> Cow<'_, str> {
     if copied == 0 {
         return Cow::Borrowed(s);
     }
-    out.push_str(&s[copied..]);
+    out.push_str(s.get(copied..).unwrap_or_default());
     Cow::Owned(out)
 }
 
@@ -71,14 +70,14 @@ fn unescape_brackets(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
     let mut out = String::new();
     let (mut copied, mut i) = (0, 0);
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'['
-            && bytes[i + 1] == b'['
+    while let Some(pair) = bytes.get(i..i + 2) {
+        if pair == b"[["
             && let Some(end) = bracketed(bytes, i + 1)
             && bytes.get(end) == Some(&b']')
         {
-            out.push_str(&s[copied..i]);
-            out.push_str(&s[i + 1..end]);
+            out.push_str(s.get(copied..i).unwrap_or_default());
+            // `[[text]]` becomes `[text]`.
+            out.push_str(s.get(i + 1..end).unwrap_or_default());
             copied = end + 1;
             i = end + 1;
         } else {
@@ -88,7 +87,7 @@ fn unescape_brackets(s: &str) -> Cow<'_, str> {
     if copied == 0 {
         return Cow::Borrowed(s);
     }
-    out.push_str(&s[copied..]);
+    out.push_str(s.get(copied..).unwrap_or_default());
     Cow::Owned(out)
 }
 

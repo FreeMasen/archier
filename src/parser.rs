@@ -279,7 +279,10 @@ impl<'a> StandardParser<'a> {
         let Some(i) = rest.find(['\n', '\r']) else {
             return Some((pos..self.text.len(), self.text.len()));
         };
-        let terminator = if rest[i..].starts_with("\r\n") { 2 } else { 1 };
+        let crlf = rest
+            .get(i..)
+            .is_some_and(|ending| ending.starts_with("\r\n"));
+        let terminator = if crlf { 2 } else { 1 };
         Some((pos..pos + i, pos + i + terminator))
     }
 
@@ -306,7 +309,7 @@ impl<'a> StandardParser<'a> {
         };
         self.pos = next;
         let text = self.text;
-        let line = &text[range.clone()];
+        let line = text.get(range.clone()).unwrap_or_default();
         let at = |r: Range<usize>| range.start + r.start..range.start + r.end;
 
         if self.skipping {
@@ -451,7 +454,10 @@ impl<'a> StandardParser<'a> {
     }
 
     fn single_line(&self, value: Range<usize>) -> Cow<'a, str> {
-        match self.options.format_value(&self.text[value]) {
+        match self
+            .options
+            .format_value(self.text.get(value).unwrap_or_default())
+        {
             Cow::Borrowed(value) => scanners::trim(value).into(),
             Cow::Owned(value) => scanners::trim(&value).to_owned().into(),
         }
@@ -470,7 +476,7 @@ impl<'a> StandardParser<'a> {
         let mut end = first.end;
         let mut escaped = false;
         while let Some((line, after)) = self.line_at(pos) {
-            let content = &text[line.clone()];
+            let content = text.get(line.clone()).unwrap_or_default();
             match scanners::classify(content, ctx) {
                 Line::Text => {
                     escaped |= scanners::is_escaped(content);
@@ -528,8 +534,9 @@ fn multi_line(
     escaped: bool,
     options: Options,
 ) -> Cow<'_, str> {
+    let first_line = text.get(first.clone()).unwrap_or_default();
     if !options.formats_values() && !escaped {
-        let head = &text[first.clone()];
+        let head = first_line;
         let lead = head.len() - head.trim_start_matches(scanners::is_whitespace).len();
         let start = if lead == head.len() {
             body
@@ -539,27 +546,28 @@ fn multi_line(
         if start >= end {
             return Cow::Borrowed("");
         }
-        return Cow::Borrowed(text[start..end].trim_end_matches(scanners::is_whitespace));
+        let value = text.get(start..end).unwrap_or_default();
+        return Cow::Borrowed(value.trim_end_matches(scanners::is_whitespace));
     }
 
     let mut value = String::new();
-    let head = options.format_value(&text[first.clone()]);
+    let head = options.format_value(first_line);
     let head = head.trim_start_matches(scanners::is_whitespace);
     if !head.is_empty() {
         value.push_str(head);
-        value.push_str(&text[first.end..body.clamp(first.end, end.max(first.end))]);
+        // The first line's ending.
+        let ending = first.end..body.clamp(first.end, end.max(first.end));
+        value.push_str(text.get(ending).unwrap_or_default());
     }
-    if end > body {
-        for line in lines_inclusive(&text[body..end]) {
-            let line = options.format_value(line);
-            let indent = line.len() - line.trim_start_matches(scanners::is_whitespace).len();
-            match line[indent..].strip_prefix('\\') {
-                Some(rest) => {
-                    value.push_str(&line[..indent]);
-                    value.push_str(rest);
-                }
-                None => value.push_str(&line),
+    for line in lines_inclusive(text.get(body..end).unwrap_or_default()) {
+        let line = options.format_value(line);
+        let unindented = line.trim_start_matches(scanners::is_whitespace);
+        match unindented.strip_prefix('\\') {
+            Some(rest) => {
+                value.push_str(line.strip_suffix(unindented).unwrap_or_default());
+                value.push_str(rest);
             }
+            None => value.push_str(&line),
         }
     }
     value.truncate(value.trim_end_matches(scanners::is_whitespace).len());
@@ -574,11 +582,11 @@ fn lines_inclusive(text: &str) -> impl Iterator<Item = &str> {
             return None;
         }
         let end = match rest.find(['\n', '\r']) {
-            Some(i) if rest[i..].starts_with("\r\n") => i + 2,
+            Some(i) if rest.get(i..).is_some_and(|e| e.starts_with("\r\n")) => i + 2,
             Some(i) => i + 1,
             None => rest.len(),
         };
-        let (line, tail) = rest.split_at(end);
+        let (line, tail) = rest.split_at_checked(end)?;
         rest = tail;
         Some(line)
     })
@@ -627,14 +635,20 @@ mod tests {
     fn single_line_values_borrow() {
         let events = events("key: value\nignored text\nother:  x  ");
         assert_eq!(events, [pair("key", "value"), pair("other", "x")]);
-        assert!(matches!(&events[0], Event::Pair(_, Cow::Borrowed(_))));
+        assert!(matches!(
+            events.first(),
+            Some(Event::Pair(_, Cow::Borrowed(_)))
+        ));
     }
 
     #[test]
     fn multi_line_values() {
         let events = events("key: one  \n two\n\n:end\n");
         assert_eq!(events, [pair("key", "one  \n two")]);
-        assert!(matches!(&events[0], Event::Pair(_, Cow::Borrowed(_))));
+        assert!(matches!(
+            events.first(),
+            Some(Event::Pair(_, Cow::Borrowed(_)))
+        ));
 
         let events = Parser::new("key: one\n  \\:end\n\\\\x\n:end").collect::<Vec<_>>();
         assert_eq!(events, [pair("key", "one\n  :end\n\\x")]);
@@ -715,13 +729,16 @@ mod tests {
         let text = "a: one [note] two\nb: [x] first\n\\[c] second [[kept]]\n:end\n[+f]\nk: v [c]\ntext [c]\n";
         let with = |options| Parser::new_ext(text, options).collect::<Vec<_>>();
         assert_eq!(
-            with(Options::ENABLE_INLINE_COMMENTS)[..2],
-            [pair("a", "one  two"), pair("b", "first\n second [kept]")]
+            with(Options::ENABLE_INLINE_COMMENTS).get(..2),
+            Some(&[pair("a", "one  two"), pair("b", "first\n second [kept]")][..])
         );
         assert!(with(Options::ENABLE_INLINE_COMMENTS).contains(&pair("k", "v")));
         // Freeform text lines keep their brackets, as in archieml-js.
         assert!(with(Options::ENABLE_INLINE_COMMENTS).contains(&Event::Text("text [c]".into())));
-        assert_eq!(with(Options::empty())[0], pair("a", "one [note] two"));
+        assert_eq!(
+            with(Options::empty()).first(),
+            Some(&pair("a", "one [note] two"))
+        );
     }
 
     #[test]

@@ -129,7 +129,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn rest(&self) -> &'a str {
-        &self.line[self.pos..]
+        self.line.get(self.pos..).unwrap_or_default()
     }
 
     /// Consumes and returns the longest prefix of characters matching `pred`.
@@ -137,7 +137,7 @@ impl<'a> Cursor<'a> {
         let rest = self.rest();
         let len = rest.find(|c| !pred(c)).unwrap_or(rest.len());
         self.pos += len;
-        &rest[..len]
+        rest.get(..len).unwrap_or_default()
     }
 
     fn skip_whitespace(&mut self) {
@@ -197,7 +197,8 @@ pub(crate) fn scan_command(line: &str) -> Option<Command> {
     cursor.skip_inline_whitespace();
     let rest = cursor.rest().as_bytes();
     let starts_with = |word: &str| {
-        rest.len() >= word.len() && rest[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+        rest.get(..word.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(word.as_bytes()))
     };
     // `endskip` must be checked before `end`.
     [

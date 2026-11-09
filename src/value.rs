@@ -81,24 +81,25 @@ impl<'a> Map<'a> {
     }
 
     pub fn get(&self, key: &str) -> Option<&Value<'a>> {
-        self.position(key).map(|i| &self.entries[i].1)
+        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Value<'a>> {
-        self.position(key).map(|i| &mut self.entries[i].1)
+        self.entries
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     /// Sets `key` to `value`, returning the previous value. A replaced key keeps its
     /// original position.
     pub fn insert(&mut self, key: impl Into<Cow<'a, str>>, value: Value<'a>) -> Option<Value<'a>> {
         let key = key.into();
-        match self.position(&key) {
-            Some(i) => Some(std::mem::replace(&mut self.entries[i].1, value)),
-            None => {
-                self.entries.push((key, value));
-                None
-            }
+        if let Some(existing) = self.get_mut(&key) {
+            return Some(std::mem::replace(existing, value));
         }
+        self.entries.push((key, value));
+        None
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value<'a>> {
@@ -125,22 +126,20 @@ impl<'a> Map<'a> {
     }
 
     /// The object at `key`, replacing whatever non-object value is there.
-    fn object_at(&mut self, key: Cow<'a, str>) -> &mut Map<'a> {
-        let i = match self.position(&key) {
-            Some(i) => {
-                if !matches!(self.entries[i].1, Value::Object(_)) {
-                    self.entries[i].1 = Value::Object(Map::new());
-                }
-                i
-            }
+    fn object_at(&mut self, key: Cow<'a, str>) -> Option<&mut Map<'a>> {
+        let value = match self.position(&key) {
+            Some(i) => &mut self.entries.get_mut(i)?.1,
             None => {
                 self.entries.push((key, Value::Object(Map::new())));
-                self.entries.len() - 1
+                &mut self.entries.last_mut()?.1
             }
         };
-        match &mut self.entries[i].1 {
-            Value::Object(map) => map,
-            _ => unreachable!(),
+        if !matches!(value, Value::Object(_)) {
+            *value = Value::Object(Map::new());
+        }
+        match value {
+            Value::Object(map) => Some(map),
+            _ => None,
         }
     }
 
@@ -149,14 +148,14 @@ impl<'a> Map<'a> {
     fn parent_of(
         &mut self,
         mut segments: impl Iterator<Item = Cow<'a, str>>,
-    ) -> (&mut Map<'a>, Cow<'a, str>) {
+    ) -> Option<(&mut Map<'a>, Cow<'a, str>)> {
         let mut last = segments.next().unwrap_or_default();
         let mut map = self;
         for segment in segments {
-            map = map.object_at(last);
+            map = map.object_at(last)?;
             last = segment;
         }
-        (map, last)
+        Some((map, last))
     }
 }
 
@@ -476,7 +475,7 @@ impl<'a> Builder<'a, '_> {
         }
         path.truncate(start);
 
-        let (parent, last) = self.scope_object()?.parent_of(segments.iter().cloned());
+        let (parent, last) = self.scope_object()?.parent_of(segments.iter().cloned())?;
         if !(merge && matches!(parent.get(&last), Some(Value::Object(_)))) {
             parent.insert(last, value);
         }

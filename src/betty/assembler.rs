@@ -352,21 +352,35 @@ impl<'a> Assembler<'a, '_> {
         *self.stack.last().expect("the stack is never empty")
     }
 
+    fn kind(&self, id: NodeId<'a>) -> Option<&Kind<'a>> {
+        self.nodes.get(id).map(|node| &node.kind)
+    }
+
+    fn kind_mut(&mut self, id: NodeId<'a>) -> Option<&mut Kind<'a>> {
+        self.nodes.get_mut(id).map(|node| &mut node.kind)
+    }
+
+    fn parent(&self, id: NodeId<'a>) -> Option<NodeId<'a>> {
+        self.nodes.get(id).and_then(|node| node.parent)
+    }
+
+    /// An array's type (which is itself unset until something is added), or `None` for
+    /// an object.
     fn array_type(&self, id: NodeId<'a>) -> Option<Option<ArrayType>> {
-        match &self.nodes[id].kind {
+        match self.kind(id)? {
             Kind::Array { ty, .. } => Some(*ty),
             Kind::Object(_) => None,
         }
     }
 
     fn set_array_type(&mut self, id: NodeId<'a>, new: ArrayType) {
-        if let Kind::Array { ty, .. } = &mut self.nodes[id].kind {
+        if let Some(Kind::Array { ty, .. }) = self.kind_mut(id) {
             *ty = Some(new);
         }
     }
 
     fn push_item(&mut self, id: NodeId<'a>, value: Val<'a>) {
-        if let Kind::Array { items, .. } = &mut self.nodes[id].kind {
+        if let Some(Kind::Array { items, .. }) = self.kind_mut(id) {
             items.push(value);
         }
     }
@@ -384,7 +398,7 @@ impl<'a> Assembler<'a, '_> {
     /// JavaScript's `key in value`.
     fn has(&self, value: Js<'a>, key: &str) -> Result<bool> {
         match value {
-            Js::Node(id) => Ok(match &self.nodes[id].kind {
+            Js::Node(id) => Ok(match self.kind(id).ok_or(Thrown)? {
                 Kind::Object(props) => find(props, key).is_some() || OBJECT_METHODS.contains(&key),
                 Kind::Array { items, props, .. } => {
                     array_index(key).is_some_and(|i| i < items.len())
@@ -410,7 +424,7 @@ impl<'a> Assembler<'a, '_> {
         };
         Ok(match value {
             Js::Undefined => return Err(Thrown),
-            Js::Node(id) => match &self.nodes[id].kind {
+            Js::Node(id) => match self.kind(id).ok_or(Thrown)? {
                 Kind::Object(props) => find(props, key).map_or_else(|| method(&[]), |v| self.js(v)),
                 Kind::Array { items, props, .. } => {
                     if let Some(item) = array_index(key).and_then(|i| items.get(i)) {
@@ -470,11 +484,11 @@ impl<'a> Assembler<'a, '_> {
     /// Returns whether `value` was stored: assigning an array's `length` converts the
     /// value to a number and resizes the array instead.
     fn assign(&mut self, id: NodeId<'a>, key: Cow<'a, str>, value: Val<'a>) -> Result<bool> {
-        let length = match (&self.nodes[id].kind, &*key) {
+        let length = match (self.kind(id).ok_or(Thrown)?, &*key) {
             (Kind::Array { .. }, "length") => Some(self.to_length(&value)?),
             _ => None,
         };
-        match (&mut self.nodes[id].kind, length) {
+        match (self.kind_mut(id).ok_or(Thrown)?, length) {
             (Kind::Object(props), _) => set(props, key, value),
             (Kind::Array { items, .. }, Some(length)) => {
                 // Growing an array would add holes, which documents can't hold.
@@ -485,9 +499,12 @@ impl<'a> Assembler<'a, '_> {
                 return Ok(false);
             }
             (Kind::Array { items, props, .. }, None) => match array_index(&key) {
-                Some(i) if i < items.len() => items[i] = value,
-                Some(i) if i == items.len() => items.push(value),
-                Some(_) => return Err(Thrown),
+                Some(i) => match (items.len(), items.get_mut(i)) {
+                    (_, Some(item)) => *item = value,
+                    (len, None) if i == len => items.push(value),
+                    // Past the end, the array would get holes, which documents can't hold.
+                    (_, None) => return Err(Thrown),
+                },
                 None => set(props, key, value),
             },
         }
@@ -505,14 +522,15 @@ impl<'a> Assembler<'a, '_> {
     fn to_js_string(&self, value: &Val<'a>) -> String {
         match value {
             Val::Str(s) => s.to_string(),
-            Val::Node(id) => match &self.nodes[*id].kind {
+            Val::Node(id) => match self.kind(*id) {
                 // Arrays convert by joining their elements.
-                Kind::Array { items, .. } => items
+                Some(Kind::Array { items, .. }) => items
                     .iter()
                     .map(|v| self.to_js_string(v))
                     .collect::<Vec<_>>()
                     .join(","),
-                Kind::Object(_) => "[object Object]".to_owned(),
+                Some(Kind::Object(_)) => "[object Object]".to_owned(),
+                None => String::new(),
             },
         }
     }
@@ -556,8 +574,9 @@ impl<'a> Assembler<'a, '_> {
         let stored = self.assign(branch, terminal, value.clone())?;
         if let (true, Val::Node(id)) = (stored, value) {
             // `PARENT` can't be redefined: betty throws after the assignment.
-            match self.nodes[id].parent {
-                None => self.nodes[id].parent = Some(branch),
+            let node = self.nodes.get_mut(id).ok_or(Thrown)?;
+            match node.parent {
+                None => node.parent = Some(branch),
                 Some(parent) if parent == branch => {}
                 Some(_) => return Err(Thrown),
             }
@@ -601,9 +620,9 @@ impl<'a> Assembler<'a, '_> {
             Some(ArrayType::Simple) => {}
             _ => {
                 self.set_array_type(array, ArrayType::Standard);
-                let last = match &self.nodes[array].kind {
-                    Kind::Array { items, .. } => items.last().cloned(),
-                    Kind::Object(_) => None,
+                let last = match self.kind(array) {
+                    Some(Kind::Array { items, .. }) => items.last().cloned(),
+                    _ => None,
                 };
                 // A new item starts when the last one already has a truthy value there.
                 let element = match last {
@@ -727,14 +746,14 @@ impl<'a> Assembler<'a, '_> {
     fn close_named(&mut self, name: &str) {
         let mut current = Some(self.pop_context());
         while let Some(id) = current {
-            if id == self.root || self.nodes[id].name.as_deref() == Some(name) {
+            let named = self.nodes.get(id).and_then(|node| node.name.as_deref()) == Some(name);
+            if id == self.root || named {
                 break;
             }
-            current = self.nodes[id].parent;
+            current = self.parent(id);
         }
         // Betty throws on reaching a node without a parent; continue nowhere instead.
-        self.stack
-            .push(current.and_then(|id| self.nodes[id].parent));
+        self.stack.push(current.and_then(|id| self.parent(id)));
     }
 
     fn close_object(&mut self, name: Option<&str>) {
@@ -770,7 +789,7 @@ impl<'a> Assembler<'a, '_> {
             return None;
         }
         ancestors.push(id);
-        let value = match &self.nodes[id].kind {
+        let value = match self.kind(id)? {
             Kind::Object(props) => Value::Object(
                 props
                     .iter()
