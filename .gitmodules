@@ -1,0 +1,3 @@
+[submodule "conformance/archieml.org"]
+	path = conformance/archieml.org
+	url = https://github.com/newsdev/archieml.org
