@@ -9,30 +9,61 @@ use std::ops::Range;
 use crate::options::Options;
 use crate::scanners::{self, Bracket, Command, Context, Line};
 
-/// A key exactly as written in the source, which may use dot-notation (`a.b.c`).
+/// A key as written in the source, which may use dot-notation (`a.b.c`). It borrows
+/// from the source unless parsing had to change it.
 ///
 /// Outside of freeform arrays, each dot introduces a level of nesting; see
 /// [`Key::segments`]. Inside freeform arrays the whole key is used verbatim as the
 /// element's `type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Key<'a>(&'a str);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Key<'a>(Cow<'a, str>);
 
 impl<'a> Key<'a> {
+    pub(crate) const fn borrowed(key: &'a str) -> Self {
+        Key(Cow::Borrowed(key))
+    }
+
+    #[cfg_attr(not(feature = "betty"), allow(dead_code))]
+    pub(crate) fn from_cow(key: Cow<'a, str>) -> Self {
+        Key(key)
+    }
+
     /// The key as written, including any dots.
-    pub fn as_str(&self) -> &'a str {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The dot-separated segments of the key. In standard ArchieML, the first and last
+    /// segments are never empty, but inner ones can be: `a..b` has the segments `a`, ``
+    /// and `b`.
+    pub fn segments(&self) -> std::str::Split<'_, char> {
+        self.0.split('.')
+    }
+
+    pub fn into_cow(self) -> Cow<'a, str> {
         self.0
     }
 
-    /// The dot-separated segments of the key. The first and last segments are never
-    /// empty, but inner ones can be: `a..b` has the segments `a`, `` and `b`.
-    pub fn segments(&self) -> std::str::Split<'a, char> {
-        self.0.split('.')
+    pub fn into_owned(self) -> Key<'static> {
+        Key(Cow::Owned(self.0.into_owned()))
+    }
+}
+
+impl<'a> From<&'a str> for Key<'a> {
+    fn from(key: &'a str) -> Self {
+        Key::borrowed(key)
+    }
+}
+
+impl From<String> for Key<'_> {
+    fn from(key: String) -> Self {
+        Key(Cow::Owned(key))
     }
 }
 
 impl fmt::Display for Key<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
@@ -110,6 +141,9 @@ pub enum Event<'a> {
     Item(Cow<'a, str>),
     /// A line of plain text inside a freeform array: an element whose `type` is `text`.
     Text(Cow<'a, str>),
+    /// Betty's `{/name}` or `[/name]`, which close blocks back to the one called `name`.
+    /// Only produced with [`Options::BETTY`].
+    EndNamed(TagEnd, Key<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +174,7 @@ enum Frame<'a> {
 }
 
 /// The key that keys and nested blocks inside a `{+key}` object are stored under.
-const FREEFORM_OBJECT_KEY: Key<'static> = Key("value");
+const FREEFORM_OBJECT_KEY: &str = "value";
 
 /// A pull parser for ArchieML, yielding [`Event`]s.
 ///
@@ -158,6 +192,52 @@ const FREEFORM_OBJECT_KEY: Key<'static> = Key("value");
 /// ```
 #[derive(Debug)]
 pub struct Parser<'a> {
+    inner: Inner<'a>,
+}
+
+#[derive(Debug)]
+enum Inner<'a> {
+    Standard(StandardParser<'a>),
+    #[cfg(feature = "betty")]
+    Betty(crate::betty::BettyParser<'a>),
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(text: &'a str) -> Self {
+        Parser::new_ext(text, Options::empty())
+    }
+
+    pub fn new_ext(text: &'a str, options: Options) -> Self {
+        #[cfg(feature = "betty")]
+        if options.contains(Options::BETTY) {
+            return Parser {
+                inner: Inner::Betty(crate::betty::BettyParser::new(text)),
+            };
+        }
+        Parser {
+            inner: Inner::Standard(StandardParser::new(text, options)),
+        }
+    }
+
+    /// Converts into an iterator that also yields the byte range of the source that
+    /// produced each event. Events that the source implies without spelling out (such as
+    /// closing an array when another one opens) have an empty range.
+    pub fn into_offset_iter(self) -> OffsetIter<'a> {
+        OffsetIter { inner: self }
+    }
+
+    fn next_event(&mut self) -> Option<(Event<'a>, Range<usize>)> {
+        match &mut self.inner {
+            Inner::Standard(parser) => parser.next_event(),
+            #[cfg(feature = "betty")]
+            Inner::Betty(parser) => parser.next_event(),
+        }
+    }
+}
+
+/// The parser for standard ArchieML.
+#[derive(Debug)]
+struct StandardParser<'a> {
     text: &'a str,
     options: Options,
     /// Start of the next unread line.
@@ -168,13 +248,9 @@ pub struct Parser<'a> {
     queue: VecDeque<(Event<'a>, Range<usize>)>,
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(text: &'a str) -> Self {
-        Parser::new_ext(text, Options::empty())
-    }
-
-    pub fn new_ext(text: &'a str, options: Options) -> Self {
-        Parser {
+impl<'a> StandardParser<'a> {
+    fn new(text: &'a str, options: Options) -> Self {
+        StandardParser {
             text,
             options,
             pos: 0,
@@ -183,13 +259,6 @@ impl<'a> Parser<'a> {
             finished: false,
             queue: VecDeque::new(),
         }
-    }
-
-    /// Converts into an iterator that also yields the byte range of the source that
-    /// produced each event. Events that the source implies without spelling out (such as
-    /// closing an array when another one opens) have an empty range.
-    pub fn into_offset_iter(self) -> OffsetIter<'a> {
-        OffsetIter { inner: self }
     }
 
     fn next_event(&mut self) -> Option<(Event<'a>, Range<usize>)> {
@@ -255,14 +324,14 @@ impl<'a> Parser<'a> {
             // An `:end` that doesn't follow a value has no effect; ones that do are
             // consumed while reading the value.
             Line::Command(Command::End | Command::EndSkip) => {}
-            Line::Key { key, value } => self.key(Key(key), at(value), range, next),
+            Line::Key { key, value } => self.key(key, at(value), range, next),
             Line::Bullet { value } => self.bullet(at(value), range, next),
             Line::Open {
                 bracket,
                 nested,
                 freeform,
                 key,
-            } => self.open(bracket, nested, freeform, Key(key), range),
+            } => self.open(bracket, nested, freeform, key, range),
             Line::Close => {
                 if !self.stack.is_empty() {
                     self.pop(range);
@@ -283,13 +352,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn key(&mut self, key: Key<'a>, value: Range<usize>, line: Range<usize>, next: usize) {
+    fn key(&mut self, key: &'a str, value: Range<usize>, line: Range<usize>, next: usize) {
         let freeform_key = match self.stack.last_mut() {
             Some(Frame::Array(array)) if array.kind == ArrayKind::Freeform => Some(key),
             Some(Frame::Object { freeform: true }) => Some(FREEFORM_OBJECT_KEY),
             Some(Frame::Array(array)) => {
                 array.kind = ArrayKind::Objects;
-                self.delimit(key.as_str(), line.start);
+                self.delimit(key, line.start);
                 None
             }
             _ => None,
@@ -298,11 +367,11 @@ impl<'a> Parser<'a> {
             // Plain-text lines in freeform blocks don't belong to the preceding value (in
             // freeform arrays they are elements of their own), so it is a single line.
             let value = self.single_line(value);
-            self.emit(Event::Pair(key, value), line);
+            self.emit(Event::Pair(Key::borrowed(key), value), line);
             return;
         }
         let (value, end) = self.value(value, next);
-        self.emit(Event::Pair(key, value), line.start..end);
+        self.emit(Event::Pair(Key::borrowed(key), value), line.start..end);
     }
 
     fn bullet(&mut self, value: Range<usize>, line: Range<usize>, next: usize) {
@@ -318,7 +387,7 @@ impl<'a> Parser<'a> {
         bracket: Bracket,
         nested: bool,
         freeform: bool,
-        key: Key<'a>,
+        key: &'a str,
         line: Range<usize>,
     ) {
         let mut key = key;
@@ -328,7 +397,7 @@ impl<'a> Parser<'a> {
                     if matches!(array.kind, ArrayKind::Undetermined | ArrayKind::Objects) =>
                 {
                     array.kind = ArrayKind::Objects;
-                    self.delimit(key.as_str(), line.start);
+                    self.delimit(key, line.start);
                 }
                 Some(Frame::Object { freeform: true }) => key = FREEFORM_OBJECT_KEY,
                 _ => {}
@@ -337,6 +406,7 @@ impl<'a> Parser<'a> {
             self.close_all(line.start);
         }
 
+        let key = Key::borrowed(key);
         let (tag, frame) = match bracket {
             Bracket::Curly => (Tag::Object { key, nested }, Frame::Object { freeform }),
             Bracket::Square => (
@@ -550,7 +620,7 @@ mod tests {
     }
 
     fn pair<'a>(key: &'a str, value: &'a str) -> Event<'a> {
-        Event::Pair(Key(key), value.into())
+        Event::Pair(Key::borrowed(key), value.into())
     }
 
     #[test]
@@ -592,7 +662,7 @@ mod tests {
             events,
             [
                 Event::Start(Tag::Array {
-                    key: Key("list"),
+                    key: Key::borrowed("list"),
                     nested: false,
                     freeform: false
                 }),
@@ -615,13 +685,13 @@ mod tests {
             events,
             [
                 Event::Start(Tag::Array {
-                    key: Key("a"),
+                    key: Key::borrowed("a"),
                     nested: false,
                     freeform: false
                 }),
                 Event::Start(Tag::Element),
                 Event::Start(Tag::Array {
-                    key: Key("b"),
+                    key: Key::borrowed("b"),
                     nested: true,
                     freeform: false
                 }),
@@ -630,7 +700,7 @@ mod tests {
                 Event::End(TagEnd::Element),
                 Event::End(TagEnd::Array),
                 Event::Start(Tag::Object {
-                    key: Key("c"),
+                    key: Key::borrowed("c"),
                     nested: false
                 }),
                 pair("k", "v"),
@@ -690,12 +760,12 @@ mod tests {
             events("{+obj}\nname: x\nignored text\n[.list]\n[]"),
             [
                 Event::Start(Tag::Object {
-                    key: Key("obj"),
+                    key: Key::borrowed("obj"),
                     nested: false
                 }),
                 pair("value", "x"),
                 Event::Start(Tag::Array {
-                    key: Key("value"),
+                    key: Key::borrowed("value"),
                     nested: true,
                     freeform: false
                 }),
@@ -712,7 +782,7 @@ mod tests {
             events,
             [
                 Event::Start(Tag::Array {
-                    key: Key("body"),
+                    key: Key::borrowed("body"),
                     nested: false,
                     freeform: true
                 }),

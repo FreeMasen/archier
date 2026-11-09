@@ -57,9 +57,42 @@
 //! |---|---|---|---|
 //! | `Options::CASE_INSENSITIVE_KEYS` | §1.3, optional | `case-insensitive` | yes |
 //! | `Options::ENABLE_INLINE_COMMENTS` | §7, deprecated | `inline-comments` | no |
+//! | `Options::BETTY` | [betty dialect](#betty) | `betty` | no |
+//!
+//! [`Loader`] adds hooks that transform keys and values as documents are built, like
+//! betty's `onFieldName` and `onValue`.
+//!
+//! # Betty
+//!
+//! [Betty](https://github.com/nprapps/betty) is the ArchieML dialect NPR uses in its
+//! [interactive template](https://github.com/nprapps/interactive-template). It adds:
+//!
+//! - `key::` … `::key` multi-line values, which can contain any text;
+//! - `{/name}` and `[/name]`, which close blocks back to the one called `name`;
+//! - list items that start at any repeated key, not only the first.
+//!
+//! It also differs from standard ArchieML in smaller ways; for instance, `key:` with no
+//! value on the last line is ignored, and `* item` outside a list hides the keys that
+//! follow it. `Options::BETTY` reproduces betty 1.0.11's output exactly, including those
+//! differences, and is checked against betty itself. The parser's events then describe
+//! betty's instructions: `Start` and `End` aren't balanced, [`Event::EndNamed`] closes
+//! named blocks, and [`Event::Text`] can appear outside freeform arrays.
+//!
+//! Where betty throws an error and produces nothing, archier carries on:
+//!
+//! - an array key made only of `+` and `.`, such as `[+.]`, is plain text;
+//! - a `key::` whose key isn't a valid JavaScript pattern, such as `a(::`, closes at
+//!   the first `::` line containing the key;
+//! - after a `{/name}` or `[/name]` with no such block, values are dropped until the
+//!   next top-level block;
+//! - any other instruction betty would throw on is skipped.
+//!
+//! `__proto__` is an ordinary key, rather than JavaScript's prototype.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "betty")]
+mod betty;
 #[cfg(feature = "inline-comments")]
 mod comments;
 mod options;
@@ -69,7 +102,7 @@ pub mod value;
 
 pub use options::Options;
 pub use parser::{Event, Key, OffsetIter, Parser, Tag, TagEnd};
-pub use value::{Map, Value, load, load_ext};
+pub use value::{Loader, Map, Value, load, load_ext};
 
 /// The version of the ArchieML spec this crate implements, which (as the spec asks of
 /// parsers written before 1.0 is final) names the candidate recommendation followed.

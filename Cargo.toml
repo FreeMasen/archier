@@ -17,12 +17,15 @@ default = ["case-insensitive"]
 case-insensitive = []
 # Spec §7 (deprecated): `Options::ENABLE_INLINE_COMMENTS`.
 inline-comments = []
+# NPR's betty dialect: `Options::BETTY`.
+betty = ["dep:id-arena"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+id-arena = { version = "2.3.0", optional = true }
 
 [dev-dependencies]
 # `preserve_order` keeps the document's key order in examples/to_json.rs.

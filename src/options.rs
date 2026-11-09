@@ -35,6 +35,13 @@ impl Options {
     #[cfg_attr(docsrs, doc(cfg(feature = "inline-comments")))]
     pub const ENABLE_INLINE_COMMENTS: Options = Options(1 << 1);
 
+    /// Parse NPR's betty dialect instead of standard ArchieML, reproducing betty's output
+    /// exactly (see the [crate documentation](crate#betty)). The other options have no
+    /// effect in betty mode; use [`Loader`](crate::Loader) hooks to transform keys.
+    #[cfg(feature = "betty")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "betty")))]
+    pub const BETTY: Options = Options(1 << 2);
+
     pub const fn empty() -> Options {
         Options(0)
     }
@@ -67,12 +74,12 @@ impl Options {
     }
 
     /// A key as it should appear in a built document.
-    pub(crate) fn document_key(self, key: &str) -> Cow<'_, str> {
+    pub(crate) fn document_key(self, key: Cow<'_, str>) -> Cow<'_, str> {
         #[cfg(feature = "case-insensitive")]
         if self.contains(Options::CASE_INSENSITIVE_KEYS) {
             return Cow::Owned(key.to_lowercase());
         }
-        Cow::Borrowed(key)
+        key
     }
 
     /// Whether [`format_value`](Options::format_value) can change a value.

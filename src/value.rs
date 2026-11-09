@@ -206,6 +206,112 @@ impl<'a> std::ops::Index<&str> for Map<'a> {
     }
 }
 
+/// Transforms a key segment, as given to [`Loader::on_field_name`].
+type FieldNameHook<'h> = Box<dyn for<'k> Fn(Cow<'k, str>) -> Cow<'k, str> + 'h>;
+/// Transforms a value, as given to [`Loader::on_value`].
+type ValueHook<'h> = Box<dyn for<'v> Fn(&str, Cow<'v, str>) -> Cow<'v, str> + 'h>;
+
+/// Builds documents with [`Options`] and optional hooks that transform keys and values,
+/// like betty's `onFieldName` and `onValue`.
+///
+/// ```
+/// use std::borrow::Cow;
+/// use archier::{Loader, Options};
+///
+/// // Google Docs likes to capitalize the first letter of a line.
+/// let loader = Loader::new(Options::empty()).on_field_name(|name| {
+///     let mut chars = name.chars();
+///     match chars.next() {
+///         Some(first) if first.is_uppercase() => {
+///             Cow::Owned(first.to_lowercase().chain(chars).collect())
+///         }
+///         _ => name,
+///     }
+/// });
+/// let doc = loader.load("Headline: Hello");
+/// assert_eq!(doc["headline"].as_str(), Some("Hello"));
+/// ```
+pub struct Loader<'h> {
+    options: Options,
+    on_field_name: Option<FieldNameHook<'h>>,
+    on_value: Option<ValueHook<'h>>,
+}
+
+impl<'h> Loader<'h> {
+    pub fn new(options: Options) -> Self {
+        Loader {
+            options,
+            on_field_name: None,
+            on_value: None,
+        }
+    }
+
+    /// Transforms each dot-separated segment of every object key, after any lowercasing
+    /// by [`Options::CASE_INSENSITIVE_KEYS`]. The `type` of freeform array elements is
+    /// not a key, so it isn't transformed.
+    ///
+    /// In standard ArchieML, this only affects the document: the parser has already
+    /// decided which keys repeat. In betty mode, keys are compared after transforming
+    /// them, as in betty.
+    pub fn on_field_name(
+        mut self,
+        hook: impl for<'k> Fn(Cow<'k, str>) -> Cow<'k, str> + 'h,
+    ) -> Self {
+        self.on_field_name = Some(Box::new(hook));
+        self
+    }
+
+    /// Transforms each value stored in an object, given its (transformed) key. Items of
+    /// string arrays and freeform elements are not passed to the hook, as in betty.
+    pub fn on_value(
+        mut self,
+        hook: impl for<'v> Fn(&str, Cow<'v, str>) -> Cow<'v, str> + 'h,
+    ) -> Self {
+        self.on_value = Some(Box::new(hook));
+        self
+    }
+
+    /// Parses `text` and builds a document from it.
+    pub fn load<'a>(&self, text: &'a str) -> Map<'a> {
+        self.from_events(Parser::new_ext(text, self.options))
+    }
+
+    /// Builds a document from events produced by a [`Parser`] with the same options.
+    pub fn from_events<'a>(&self, events: impl IntoIterator<Item = Event<'a>>) -> Map<'a> {
+        #[cfg(feature = "betty")]
+        if self.options.contains(Options::BETTY) {
+            return crate::betty::assemble(events, self);
+        }
+        let mut builder = Builder {
+            root: Value::Object(Map::new()),
+            scope: Some(Vec::new()),
+            stack: Vec::new(),
+            loader: self,
+        };
+        for event in events {
+            builder.push(event);
+        }
+        match builder.root {
+            Value::Object(map) => map,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn field_name<'k>(&self, name: Cow<'k, str>) -> Cow<'k, str> {
+        match &self.on_field_name {
+            Some(hook) => hook(name),
+            None => name,
+        }
+    }
+
+    pub(crate) fn value<'v>(&self, key: &str, value: Cow<'v, str>) -> Cow<'v, str> {
+        match &self.on_value {
+            Some(hook) => hook(key, value),
+            None => value,
+        }
+    }
+}
+
 /// Parses an ArchieML document into a [`Map`].
 ///
 /// ```
@@ -228,7 +334,7 @@ pub fn load(text: &str) -> Map<'_> {
 /// # }
 /// ```
 pub fn load_ext(text: &str, options: Options) -> Map<'_> {
-    from_events_ext(Parser::new_ext(text, options), options)
+    Loader::new(options).load(text)
 }
 
 /// Builds a document from a stream of events, as produced by a [`Parser`].
@@ -243,19 +349,7 @@ pub fn from_events_ext<'a>(
     events: impl IntoIterator<Item = Event<'a>>,
     options: Options,
 ) -> Map<'a> {
-    let mut builder = Builder {
-        root: Value::Object(Map::new()),
-        scope: Some(Vec::new()),
-        stack: Vec::new(),
-        options,
-    };
-    for event in events {
-        builder.push(event);
-    }
-    match builder.root {
-        Value::Object(map) => map,
-        _ => unreachable!(),
-    }
+    Loader::new(options).from_events(events)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,11 +385,11 @@ struct Container<'a> {
 /// Applies events to a document, following the reference implementation's model: keys
 /// and nested blocks are placed relative to the current `scope` object, which opening an
 /// object, starting an array element and adding a freeform element all change.
-struct Builder<'a> {
+struct Builder<'a, 'l> {
     root: Value<'a>,
     scope: Location<'a>,
     stack: Vec<Container<'a>>,
-    options: Options,
+    loader: &'l Loader<'l>,
 }
 
 fn get<'v, 'a>(root: &'v Value<'a>, path: &[Segment<'a>]) -> Option<&'v Value<'a>> {
@@ -317,16 +411,20 @@ fn resolve<'v, 'a>(root: &'v mut Value<'a>, path: &[Segment<'a>]) -> Option<&'v 
 }
 
 /// A freeform array element.
-fn typed<'a>(ty: &'a str, value: Value<'a>) -> Value<'a> {
+fn typed<'a>(ty: Cow<'a, str>, value: Value<'a>) -> Value<'a> {
     Value::Object(Map::from_iter([
-        ("type", Value::String(Cow::Borrowed(ty))),
+        ("type", Value::String(ty)),
         ("value", value),
     ]))
 }
 
-impl<'a> Builder<'a> {
+impl<'a> Builder<'a, '_> {
+    /// A key's segments as they appear in the document.
     fn key(&self, key: Key<'a>) -> Vec<Cow<'a, str>> {
-        segments(&self.options.document_key(key.as_str())).collect()
+        let key = self.loader.options.document_key(key.into_cow());
+        segments(&key)
+            .map(|segment| self.loader.field_name(segment))
+            .collect()
     }
 
     fn top_array(&mut self) -> Option<(&mut Vec<Value<'a>>, &Path<'a>)> {
@@ -428,17 +526,18 @@ impl<'a> Builder<'a> {
             }
             // An element ends either when the next one starts or when its array closes.
             Event::End(TagEnd::Element) => {}
-            Event::End(_) => {
+            Event::End(_) | Event::EndNamed(..) => {
                 if let Some(container) = self.stack.pop() {
                     self.scope = container.outer_scope;
                 }
             }
             Event::Pair(key, value) => {
-                let value = Value::String(value);
                 if self.in_freeform() {
-                    self.scope = self.append(typed(key.as_str(), value));
+                    self.scope = self.append(typed(key.into_cow(), Value::String(value)));
                 } else {
                     let segments = self.key(key);
+                    let last = segments.last().map_or("", |s| s.as_ref());
+                    let value = Value::String(self.loader.value(last, value));
                     self.set(segments, value, false);
                 }
             }
@@ -447,7 +546,7 @@ impl<'a> Builder<'a> {
             }
             Event::Text(value) => {
                 if self.in_freeform() {
-                    self.append(typed("text", Value::String(value)));
+                    self.append(typed(Cow::Borrowed("text"), Value::String(value)));
                 }
             }
         }
@@ -461,7 +560,7 @@ impl<'a> Builder<'a> {
         let is_object = kind == ContainerKind::Object;
         let path = if nested && self.in_freeform() {
             // Blocks nested in freeform arrays become `{type, value}` elements.
-            let element = self.append(typed(key.as_str(), empty));
+            let element = self.append(typed(key.into_cow(), empty));
             self.scope = element.clone();
             element.map(|mut path| {
                 path.push(Segment::Key(Cow::Borrowed("value")));
@@ -616,13 +715,32 @@ mod tests {
             )]))
         );
         // Freeform types are values, not keys, so they keep their case.
-        assert_eq!(doc["body"], Value::Array(vec![typed("H1", s("x"))]));
+        assert_eq!(doc["body"], Value::Array(vec![typed("H1".into(), s("x"))]));
 
         let doc = load(text);
         assert_eq!(
             doc.keys().collect::<Vec<_>>(),
             ["Title", "TITLE", "Meta", "meta", "Body"]
         );
+    }
+
+    #[test]
+    fn hooks_transform_keys_and_values() {
+        let loader = Loader::new(Options::empty())
+            .on_field_name(|name| Cow::Owned(name.to_uppercase()))
+            .on_value(|key, value| {
+                if key == "N" {
+                    Cow::Owned(format!("<{value}>"))
+                } else {
+                    value
+                }
+            });
+        let doc = loader.load("a.n: 1\nm: 2\n[+f]\nn: 3\n[]\n[l]\n* 4\n");
+        assert_eq!(doc["A"], Value::Object(Map::from_iter([("N", s("<1>"))])));
+        assert_eq!(doc["M"], s("2"));
+        // Freeform types and items aren't keys or object values.
+        assert_eq!(doc["F"], Value::Array(vec![typed("n".into(), s("3"))]));
+        assert_eq!(doc["L"], Value::Array(vec![s("4")]));
     }
 
     #[test]
