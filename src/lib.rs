@@ -28,7 +28,7 @@
 //! ```
 //!
 //! To get the parsed document as a tree, use [`load`], which builds a [`Map`] from the
-//! events:
+//! events. The tree borrows from the source text too; [`Map::into_owned`] detaches it.
 //!
 //! ```
 //! let doc = archier::load("{person}\nname: Archie\n{}\n");

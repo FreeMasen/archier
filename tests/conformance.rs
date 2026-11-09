@@ -19,7 +19,7 @@ use serde_json::Value as Json;
 
 fn to_json(value: &Value) -> Json {
     match value {
-        Value::String(s) => Json::String(s.clone()),
+        Value::String(s) => Json::String(s.to_string()),
         Value::Array(items) => Json::Array(items.iter().map(to_json).collect()),
         Value::Object(map) => Json::Object(
             map.iter()
