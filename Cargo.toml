@@ -25,4 +25,5 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 
 [dev-dependencies]
-serde_json = "1"
+# `preserve_order` keeps the document's key order in examples/to_json.rs.
+serde_json = { version = "1", features = ["preserve_order"] }
