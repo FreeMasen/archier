@@ -6,7 +6,8 @@
 
 use std::borrow::Cow;
 
-use crate::parser::{Event, Key, Options, Parser, Tag, TagEnd};
+use crate::options::Options;
+use crate::parser::{Event, Key, Parser, Tag, TagEnd};
 
 /// An ArchieML value. All scalar values are strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,10 +181,12 @@ pub fn load(text: &str) -> Map {
 /// Parses an ArchieML document into a [`Map`] with the given [`Options`].
 ///
 /// ```
+/// # #[cfg(feature = "case-insensitive")] {
 /// use archier::Options;
 ///
 /// let doc = archier::load_ext("Title: First\ntitle: Second", Options::CASE_INSENSITIVE_KEYS);
 /// assert_eq!(doc["title"].as_str(), Some("Second"));
+/// # }
 /// ```
 pub fn load_ext(text: &str, options: Options) -> Map {
     from_events_ext(Parser::new_ext(text, options), options)
@@ -202,7 +205,7 @@ pub fn from_events_ext<'a>(events: impl IntoIterator<Item = Event<'a>>, options:
         root: Value::Object(Map::new()),
         scope: Vec::new(),
         stack: Vec::new(),
-        lowercase_keys: options.contains(Options::CASE_INSENSITIVE_KEYS),
+        options,
     };
     for event in events {
         builder.push(event);
@@ -244,7 +247,7 @@ struct Builder {
     root: Value,
     scope: Path,
     stack: Vec<Container>,
-    lowercase_keys: bool,
+    options: Options,
 }
 
 fn resolve<'v>(root: &'v mut Value, path: &[Segment]) -> Option<&'v mut Value> {
@@ -266,11 +269,7 @@ fn typed(ty: &str, value: Value) -> Value {
 
 impl Builder {
     fn key<'k>(&self, key: Key<'k>) -> Cow<'k, str> {
-        if self.lowercase_keys {
-            Cow::Owned(key.as_str().to_lowercase())
-        } else {
-            Cow::Borrowed(key.as_str())
-        }
+        self.options.document_key(key.as_str())
     }
 
     fn top_array(&mut self) -> Option<(&mut Vec<Value>, ContainerKind, &Path)> {
@@ -482,6 +481,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "case-insensitive")]
     fn case_insensitive_keys_are_lowercased() {
         let text =
             "Title: one\nTITLE: two\n{Meta.Info}\nA: 1\n{}\n{meta.info}\nb: 2\n[+Body]\nH1: x\n";

@@ -4,62 +4,10 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::iter::FusedIterator;
-use std::ops::{BitOr, BitOrAssign, Range};
+use std::ops::Range;
 
+use crate::options::Options;
 use crate::scanners::{self, Bracket, Command, Context, Line};
-
-/// Optional parser behavior, combined with `|`.
-///
-/// ```
-/// use archier::{Options, Parser};
-///
-/// let options = Options::CASE_INSENSITIVE_KEYS | Options::ENABLE_INLINE_COMMENTS;
-/// let parser = Parser::new_ext("key: value [comment]", options);
-/// # drop(parser);
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct Options(u32);
-
-impl Options {
-    /// Treat keys that differ only in case as the same key (spec §1.3). Array element
-    /// delimiters match in any case, and [`load_ext`](crate::load_ext) lowercases every
-    /// key in the document. Events still carry keys as written.
-    pub const CASE_INSENSITIVE_KEYS: Options = Options(1 << 0);
-    /// Remove inline comments from values (spec §7, deprecated): text in single square
-    /// brackets on one line is dropped, and `[[text]]` becomes `[text]`. Behaves exactly
-    /// like archieml-js's `comments` option.
-    pub const ENABLE_INLINE_COMMENTS: Options = Options(1 << 1);
-
-    pub const fn empty() -> Options {
-        Options(0)
-    }
-
-    pub const fn contains(self, other: Options) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub fn insert(&mut self, other: Options) {
-        self.0 |= other.0;
-    }
-
-    pub fn remove(&mut self, other: Options) {
-        self.0 &= !other.0;
-    }
-}
-
-impl BitOr for Options {
-    type Output = Options;
-
-    fn bitor(self, other: Options) -> Options {
-        Options(self.0 | other.0)
-    }
-}
-
-impl BitOrAssign for Options {
-    fn bitor_assign(&mut self, other: Options) {
-        self.insert(other);
-    }
-}
 
 /// A key exactly as written in the source, which may use dot-notation (`a.b.c`).
 ///
@@ -424,7 +372,7 @@ impl<'a> Parser<'a> {
                 array.delimiter = Some(key);
                 array.in_element = true;
             }
-            Some(delimiter) if same_key(options, delimiter, key) => {
+            Some(delimiter) if options.same_key(delimiter, key) => {
                 self.emit(Event::End(TagEnd::Element), at..at)
             }
             Some(_) => return,
@@ -432,16 +380,8 @@ impl<'a> Parser<'a> {
         self.emit(Event::Start(Tag::Element), at..at);
     }
 
-    fn comments(&self) -> bool {
-        self.options.contains(Options::ENABLE_INLINE_COMMENTS)
-    }
-
     fn single_line(&self, value: Range<usize>) -> Cow<'a, str> {
-        let value = &self.text[value];
-        if !self.comments() {
-            return scanners::trim(value).into();
-        }
-        match scanners::strip_comments(value) {
+        match self.options.format_value(&self.text[value]) {
             Cow::Borrowed(value) => scanners::trim(value).into(),
             Cow::Owned(value) => scanners::trim(&value).to_owned().into(),
         }
@@ -469,7 +409,7 @@ impl<'a> Parser<'a> {
                 }
                 Line::Command(Command::End) => {
                     self.pos = after;
-                    let value = multi_line(text, first, next, end, escaped, self.comments());
+                    let value = multi_line(text, first, next, end, escaped, self.options);
                     return (value, line.end);
                 }
                 _ => break,
@@ -504,34 +444,21 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn same_key(options: Options, a: &str, b: &str) -> bool {
-    let lower = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<Vec<_>>();
-    a == b || (options.contains(Options::CASE_INSENSITIVE_KEYS) && lower(a) == lower(b))
-}
-
 /// Builds a multi-line value from the rest of its first line (`first`) through `end`,
 /// where `body` is the start of the second line.
 ///
 /// Leading whitespace on the first line and trailing whitespace on the last are removed,
-/// and so is one leading backslash on every line after the first. With `comments`, inline
-/// comments are removed from every line first.
+/// and so is one leading backslash on every line after the first. Every line is first
+/// formatted as `options` require (removing inline comments, if enabled).
 fn multi_line(
     text: &str,
     first: Range<usize>,
     body: usize,
     end: usize,
     escaped: bool,
-    comments: bool,
+    options: Options,
 ) -> Cow<'_, str> {
-    let strip = |line: &str| {
-        if comments {
-            scanners::strip_comments(line).into_owned()
-        } else {
-            line.to_owned()
-        }
-    };
-
-    if !comments && !escaped {
+    if !options.formats_values() && !escaped {
         let head = &text[first.clone()];
         let lead = head.len() - head.trim_start_matches(scanners::is_whitespace).len();
         let start = if lead == head.len() {
@@ -546,7 +473,7 @@ fn multi_line(
     }
 
     let mut value = String::new();
-    let head = strip(&text[first.clone()]);
+    let head = options.format_value(&text[first.clone()]);
     let head = head.trim_start_matches(scanners::is_whitespace);
     if !head.is_empty() {
         value.push_str(head);
@@ -554,7 +481,7 @@ fn multi_line(
     }
     if end > body {
         for line in lines_inclusive(&text[body..end]) {
-            let line = strip(line);
+            let line = options.format_value(line);
             let indent = line.len() - line.trim_start_matches(scanners::is_whitespace).len();
             match line[indent..].strip_prefix('\\') {
                 Some(rest) => {
@@ -713,6 +640,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "inline-comments")]
     fn inline_comments() {
         let text = "a: one [note] two\nb: [x] first\n\\[c] second [[kept]]\n:end\n[+f]\nk: v [c]\ntext [c]\n";
         let with = |options| Parser::new_ext(text, options).collect::<Vec<_>>();
@@ -727,6 +655,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "case-insensitive")]
     fn case_insensitive_delimiters() {
         let text = "[list]\nName: a\nname: b\n";
         let elements = |options| {

@@ -8,6 +8,17 @@ categories = ["parsing", "parser-implementations"]
 exclude = ["conformance/"]
 
 
+[features]
+default = ["case-insensitive"]
+# Spec §1.3 (optional): `Options::CASE_INSENSITIVE_KEYS`.
+case-insensitive = []
+# Spec §7 (deprecated): `Options::ENABLE_INLINE_COMMENTS`.
+inline-comments = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 
 [dev-dependencies]

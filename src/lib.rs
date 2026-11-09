@@ -51,14 +51,24 @@
 //! # Options
 //!
 //! [`Parser::new_ext`] and [`load_ext`] take [`Options`] for the spec's optional and
-//! deprecated features, both off by default: case-insensitive keys (§1.3) and inline
-//! comments (§7).
+//! deprecated features. Each is off unless requested, and also needs its Cargo feature:
+//!
+//! | Option | Spec | Cargo feature | Feature on by default |
+//! |---|---|---|---|
+//! | `Options::CASE_INSENSITIVE_KEYS` | §1.3, optional | `case-insensitive` | yes |
+//! | `Options::ENABLE_INLINE_COMMENTS` | §7, deprecated | `inline-comments` | no |
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+#[cfg(feature = "inline-comments")]
+mod comments;
+mod options;
 mod parser;
 mod scanners;
 pub mod value;
 
-pub use parser::{Event, Key, OffsetIter, Options, Parser, Tag, TagEnd};
+pub use options::Options;
+pub use parser::{Event, Key, OffsetIter, Parser, Tag, TagEnd};
 pub use value::{Map, Value, load, load_ext};
 
 /// The version of the ArchieML spec this crate implements, which (as the spec asks of
