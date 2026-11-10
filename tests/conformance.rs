@@ -67,8 +67,8 @@ fn conformance_suite() {
             failures.push(format!("{name}: missing `result` key"));
             continue;
         };
-        let expected: Json = serde_json::from_str(&expected).unwrap();
-        let actual = to_json(&Value::Object(doc));
+        let expected: Json = dbg!(serde_json::from_str(&expected).unwrap());
+        let actual = dbg!(to_json(&Value::Object(doc)));
         if actual != expected {
             failures.push(format!(
                 "{name}: {description}\n  expected: {expected}\n    actual: {actual}"
