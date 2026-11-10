@@ -6,6 +6,7 @@ license = "MIT"
 authors = ["Robert Masen"]
 categories = ["parsing", "parser-implementations"]
 exclude = ["conformance/"]
+description = "A pull parser for [ArchieML](https://archieml.org)"
 
 
 [workspace]
